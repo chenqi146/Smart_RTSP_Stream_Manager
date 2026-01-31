@@ -1,0 +1,38 @@
+{
+  "nvr_ip": "10.10.11.122",
+  "parking_name": "高新四路30号一体机",
+  "channel_code": "c4",
+  "channel_name": "高新四路32号枪机",
+  "camera_ip": "192.168.1.11",
+  "camera_sn": "GXSLqj000032",
+  "track_space": "[0, 20, 1920, 389]",
+  "parking_spaces": [
+    {
+      "space_name": "GXSL088",
+      "bbox": [
+        730,
+        150,
+        308,
+        130
+      ]
+    },
+    {
+      "space_name": "GXSL087",
+      "bbox": [
+        1074,
+        170,
+        300,
+        118
+      ]
+    },
+    {
+      "space_name": "GXSL086",
+      "bbox": [
+        1406,
+        210,
+        227,
+        121
+      ]
+    }
+  ]
+}

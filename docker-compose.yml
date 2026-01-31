@@ -1,0 +1,64 @@
+# Smart RTSP Stream Manager - Docker Compose 一键部署
+# 使用: docker-compose up -d 或 docker compose up -d
+# 注：version 已废弃，新版本 Compose 会忽略，已移除避免警告
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: smart_rtsp_mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-test123456}
+      MYSQL_DATABASE: ${MYSQL_DB:-smart_rtsp}
+      MYSQL_USER: ${MYSQL_USER:-root}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-test123456}
+    ports:
+      - "${MYSQL_PORT:-3306}:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: smart_rtsp_stream_manager:latest
+    container_name: smart_rtsp_app
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      MYSQL_HOST: 127.0.0.1
+      MYSQL_PORT: 3306
+      MYSQL_USER: ${MYSQL_USER:-root}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-test123456}
+      MYSQL_DB: ${MYSQL_DB:-smart_rtsp}
+      USE_SQLITE_FALLBACK: "false"
+      # 可选：并发与 YOLO
+      MAX_COMBO_CONCURRENCY: ${MAX_COMBO_CONCURRENCY:-4}
+      MAX_WORKERS_PER_COMBO: ${MAX_WORKERS_PER_COMBO:-2}
+      YOLO_MODEL_NAME: ${YOLO_MODEL_NAME:-yolov8n.pt}
+    volumes:
+      - screenshot_data:/app/screenshots
+      - hls_data:/app/hls
+      - log_data:/app/logs
+    depends_on:
+      mysql:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  mysql_data:
+  screenshot_data:
+  hls_data:
+  log_data:

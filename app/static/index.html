@@ -1,0 +1,1827 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8" />
+  <title>Smart RTSP Stream Manager</title>
+  <!-- 智能加载外部库：检查缓存，避免重复加载，抑制不必要错误 -->
+  <script>
+    // 检查库是否已加载（利用浏览器缓存）
+    const isLibraryLoaded = {
+      hls: () => typeof window.Hls !== 'undefined',
+      flatpickr: () => typeof window.flatpickr !== 'undefined'
+    };
+
+    // 资源源列表：仅使用本地静态文件，避免外网CDN超时
+    const CDN_SOURCES = {
+      hlsjs: [
+        '/static/libs/hls.min.js',
+      ],
+      flatpickrCSS: [
+        '/static/libs/flatpickr.min.css',
+      ],
+      flatpickrJS: [
+        '/static/libs/flatpickr.min.js',
+      ]
+    };
+
+    // 抑制已知的非关键错误
+    const originalError = console.error;
+    const suppressedErrors = new Set();
+    const suppressedPatterns = [
+      /ERR_CONNECTION_TIMED_OUT/i,
+      /custom element.*already been defined/i,
+      /mce-autosize-textarea/i
+    ];
+
+    console.error = function(...args) {
+      const message = args.join(' ');
+      // 检查是否匹配需要抑制的错误模式
+      const shouldSuppress = suppressedPatterns.some(pattern => pattern.test(message));
+      if (shouldSuppress && suppressedErrors.has('suppress-patterns')) {
+        return; // 静默忽略
+      }
+      originalError.apply(console, args);
+    };
+
+    // 全局错误捕获，抑制已知错误
+    window.addEventListener('error', (event) => {
+      const message = event.message || '';
+      if (/custom element.*already been defined/i.test(message) || 
+          /mce-autosize-textarea/i.test(message)) {
+        event.preventDefault(); // 阻止错误冒泡
+        suppressedErrors.add('suppress-patterns');
+        return false;
+      }
+    }, true);
+
+    suppressedErrors.add('suppress-patterns'); // 启用错误抑制
+
+    // 快速加载脚本（带超时和错误抑制）
+    function loadScriptFast(sources, timeout = 2000) {
+      return new Promise((resolve, reject) => {
+        if (!sources || sources.length === 0) {
+          reject(new Error('没有可用的 CDN 源'));
+          return;
+        }
+
+        let resolved = false;
+        const scripts = [];
+        let timeoutId;
+
+        const cleanup = () => {
+          scripts.forEach(script => {
+            if (script.parentNode && !script.dataset.loaded) {
+              // 静默移除，不触发错误
+              try {
+                script.parentNode.removeChild(script);
+              } catch (e) {
+                // 忽略移除错误
+              }
+            }
+          });
+          if (timeoutId) clearTimeout(timeoutId);
+        };
+
+        // 为每个源创建加载 Promise（快速超时）
+        const promises = sources.map((src) => {
+          return new Promise((resolveSource, rejectSource) => {
+            const script = document.createElement('script');
+            script.src = src;
+            scripts.push(script);
+
+            // 快速超时（1.5秒）
+            const sourceTimeout = setTimeout(() => {
+              if (!resolved) {
+                rejectSource(new Error('timeout'));
+              }
+            }, 1500);
+
+            const onSuccess = () => {
+              clearTimeout(sourceTimeout);
+              if (!resolved) {
+                resolved = true;
+                script.dataset.loaded = 'true';
+                suppressedErrors.add('cdn-timeout'); // 标记已解决
+                cleanup();
+                resolve();
+              }
+            };
+
+            const onError = () => {
+              clearTimeout(sourceTimeout);
+              if (!resolved) {
+                rejectSource(new Error('load failed'));
+              }
+            };
+
+            script.onload = onSuccess;
+            script.onerror = onError;
+            document.head.appendChild(script);
+          });
+        });
+
+        // 总超时
+        timeoutId = setTimeout(() => {
+          if (!resolved) {
+            resolved = true;
+            cleanup();
+            reject(new Error('所有 CDN 源加载超时'));
+          }
+        }, timeout);
+
+        // 使用 Promise.any 获取最先成功的源
+        Promise.any(promises).catch(() => {
+          if (!resolved) {
+            reject(new Error('所有 CDN 源都加载失败'));
+          }
+        });
+      });
+    }
+
+    // 快速加载样式（带超时和错误抑制）
+    function loadStyleFast(sources, timeout = 2000) {
+      return new Promise((resolve, reject) => {
+        if (!sources || sources.length === 0) {
+          reject(new Error('没有可用的 CDN 源'));
+          return;
+        }
+
+        let resolved = false;
+        const links = [];
+        let timeoutId;
+
+        const cleanup = () => {
+          links.forEach(link => {
+            if (link.parentNode && !link.dataset.loaded) {
+              try {
+                link.parentNode.removeChild(link);
+              } catch (e) {
+                // 忽略移除错误
+              }
+            }
+          });
+          if (timeoutId) clearTimeout(timeoutId);
+        };
+
+        // 为每个源创建加载 Promise（快速超时）
+        const promises = sources.map((href) => {
+          return new Promise((resolveSource, rejectSource) => {
+            const link = document.createElement('link');
+            link.rel = 'stylesheet';
+            link.href = href;
+            links.push(link);
+
+            // 快速超时（1.5秒）
+            const sourceTimeout = setTimeout(() => {
+              if (!resolved) {
+                rejectSource(new Error('timeout'));
+              }
+            }, 1500);
+
+            const onSuccess = () => {
+              clearTimeout(sourceTimeout);
+              if (!resolved) {
+                resolved = true;
+                link.dataset.loaded = 'true';
+                suppressedErrors.add('cdn-timeout'); // 标记已解决
+                cleanup();
+                resolve();
+              }
+            };
+
+            const onError = () => {
+              clearTimeout(sourceTimeout);
+              if (!resolved) {
+                rejectSource(new Error('load failed'));
+              }
+            };
+
+            link.onload = onSuccess;
+            link.onerror = onError;
+            document.head.appendChild(link);
+          });
+        });
+
+        // 总超时
+        timeoutId = setTimeout(() => {
+          if (!resolved) {
+            resolved = true;
+            cleanup();
+            reject(new Error('所有 CDN 源加载超时'));
+          }
+        }, timeout);
+
+        // 使用 Promise.any 获取最先成功的源
+        Promise.any(promises).catch(() => {
+          if (!resolved) {
+            reject(new Error('所有 CDN 源都加载失败'));
+          }
+        });
+      });
+    }
+
+    // 智能加载所有资源（检查缓存，避免重复加载）
+    (async function loadAllResources() {
+      // 检查是否已加载，如果已加载则跳过
+      if (isLibraryLoaded.hls() && isLibraryLoaded.flatpickr()) {
+        console.log('✓ 库已缓存，跳过加载');
+        window.FLATPICKR_LOADED = true;
+        window.FLATPICKR_LOADING = false;
+        if (typeof initDatePickers === 'function') {
+          if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', () => initDatePickers());
+          } else {
+            initDatePickers();
+          }
+        }
+        return;
+      }
+
+      const startTime = performance.now();
+      
+      // 只加载缺失的库
+      const loadPromises = [];
+      
+      if (!isLibraryLoaded.hls()) {
+        loadPromises.push(
+          loadScriptFast(CDN_SOURCES.hlsjs, 2000).catch(() => {
+            window.Hls = null;
+          })
+        );
+      }
+
+      if (!isLibraryLoaded.flatpickr()) {
+        // 标记正在加载
+        window.FLATPICKR_LOADING = true;
+        
+        loadPromises.push(
+          loadStyleFast(CDN_SOURCES.flatpickrCSS, 2000).catch(() => {
+            // 静默失败
+          }),
+          loadScriptFast(CDN_SOURCES.flatpickrJS, 2000).then(() => {
+            window.FLATPICKR_LOADED = true;
+            window.FLATPICKR_LOADING = false;
+            if (typeof initDatePickers === 'function') {
+              if (document.readyState === 'loading') {
+                document.addEventListener('DOMContentLoaded', () => initDatePickers());
+              } else {
+                initDatePickers();
+              }
+            }
+          }).catch(() => {
+            window.flatpickr = null;
+            window.FLATPICKR_LOADED = false;
+            window.FLATPICKR_LOADING = false;
+          })
+        );
+      }
+
+      await Promise.allSettled(loadPromises);
+      const loadTime = ((performance.now() - startTime) / 1000).toFixed(2);
+      if (loadTime > 0.1) {
+        console.log(`资源加载完成，耗时: ${loadTime}秒`);
+      }
+    })();
+
+    // 初始化标记
+    if (!window.FLATPICKR_LOADED) {
+      window.FLATPICKR_LOADING = true;
+    }
+  </script>
+  <!-- 外部CSS文件 -->
+  <link rel="stylesheet" href="/static/css/styles.css">
+  <style>
+    /* 保留内联样式用于CDN加载相关的样式（如果需要） */
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; padding: 0;
+      font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+      background: radial-gradient(circle at 20% 20%, rgba(34,211,238,0.08), transparent 35%),
+                  radial-gradient(circle at 80% 0%, rgba(16,185,129,0.08), transparent 40%),
+                  var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: 240px 1fr;
+    }
+    header {
+      padding: 20px 24px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      background: linear-gradient(135deg, rgba(34,211,238,0.12), rgba(16,185,129,0.12));
+      border-bottom: 1px solid var(--border);
+    }
+    .title { font-size: 22px; font-weight: 700; letter-spacing: 0.3px; }
+    .subtitle { color: var(--muted); font-size: 13px; }
+    .container { padding: 20px 24px 32px; max-width: 99%; width: 100%; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+    .card {
+      background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.0));
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.25);
+    }
+    h2, h3 { margin: 0 0 12px 0; }
+    h3 { font-size: 16px; color: #f8fafc; }
+    .row { display: grid; grid-template-columns: 140px 1fr; gap: 10px; align-items: center; margin-bottom: 12px; }
+    label { color: var(--muted); font-size: 13px; }
+    input, textarea, button {
+      font-family: inherit;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: #0b1220;
+      color: var(--text);
+      padding: 10px 12px;
+      outline: none;
+      transition: border 0.2s ease, box-shadow 0.2s ease;
+    }
+    input:focus, textarea:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px rgba(34,211,238,0.15);
+    }
+    textarea { width: 100%; min-height: 160px; resize: vertical; }
+    .btn-group { display: flex; flex-wrap: wrap; gap: 10px; }
+    button {
+      cursor: pointer;
+      background: linear-gradient(135deg, var(--accent), #0ea5e9);
+      border: none;
+      font-weight: 600;
+    }
+    button.secondary { background: linear-gradient(135deg, #a855f7, #6366f1); }
+    button.ghost { background: #0b1220; border: 1px solid var(--border); color: var(--text); }
+    .split {
+      display: grid;
+      grid-template-columns: 1.1fr 0.9fr;
+      gap: 16px;
+    }
+    .video-wrapper { background: #0b1220; border: 1px solid var(--border); border-radius: 12px; padding: 12px; }
+    video { width: 100%; border-radius: 10px; background: #000; }
+    .pill {
+      display: inline-block;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: rgba(34,211,238,0.12);
+      color: #a5f3fc;
+      font-size: 12px;
+      border: 1px solid rgba(34,211,238,0.25);
+    }
+    .panel {
+      background: #0b1220;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px;
+    }
+    .muted { color: var(--muted); font-size: 12px; }
+    .muted-danger { color: #fca5a5; font-size: 12px; }
+    @media (max-width: 900px) {
+      body { grid-template-columns: 1fr; }
+      .sidebar { position: relative; width: 100%; }
+      .split { grid-template-columns: 1fr; }
+      .row { grid-template-columns: 1fr; }
+    }
+    /* NVR配置表单响应式 */
+    @media (max-width: 1200px) {
+      #nvr-config-form > div[style*="grid-template-columns:1fr 1fr"] {
+        grid-template-columns: 1fr !important;
+      }
+    }
+
+    /* Sidebar */
+    .sidebar {
+      background: #0b1220;
+      border-right: 1px solid var(--border);
+      padding: 20px 16px;
+      height: 100vh;
+      position: sticky;
+      top: 0;
+      overflow-y: auto;
+    }
+    .nav-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      cursor: pointer;
+      color: var(--text);
+      border: 1px solid transparent;
+      transition: background 0.2s, border 0.2s;
+    }
+    .nav-item.active {
+      background: rgba(34,211,238,0.12);
+      border-color: rgba(34,211,238,0.3);
+      color: #a5f3fc;
+    }
+    .nav-item:hover { background: rgba(255,255,255,0.05); }
+
+    /* Image grid（重构为“时间分组 + 通道矩阵”） */
+    .img-grid {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .img-container {
+      position: relative;
+      min-height: 160px;
+    }
+    .img-card {
+      background: #0b1220;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 8px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    /* 时间分组卡片：一个时间段对应一块卡片，内部再按通道展示 */
+    .img-time-group {
+      background: #020617;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 10px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .img-time-group-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .img-time-range {
+      font-weight: 500;
+      color: var(--text);
+    }
+    .img-time-meta {
+      font-size: 11px;
+      opacity: 0.9;
+    }
+    .img-time-group-body {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 8px;
+    }
+    .img-channel-card {
+      background: #020617;
+      border: 1px solid rgba(148,163,184,0.4);
+      border-radius: 10px;
+      padding: 6px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .img-channel-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      font-size: 11px;
+    }
+    .img-channel-title {
+      font-weight: 500;
+    }
+    .img-channel-sub {
+      font-size: 11px;
+      color: var(--muted);
+    }
+    .img-channel-ocr {
+      font-size: 11px;
+      color: #a5b4fc;
+    }
+    .img-channel-footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      font-size: 11px;
+    }
+    .img-badge-status {
+      padding: 2px 6px;
+      border-radius: 999px;
+      font-size: 10px;
+      border: 1px solid rgba(148,163,184,0.6);
+    }
+    .img-badge-status-ok {
+      background: rgba(34,197,94,0.15);
+      color: #4ade80;
+      border-color: rgba(34,197,94,0.5);
+    }
+    .img-badge-status-missing {
+      background: rgba(251,146,60,0.12);
+      color: #fb923c;
+      border-color: rgba(251,146,60,0.5);
+    }
+    .img-badge-status-failed {
+      background: rgba(248,113,113,0.14);
+      color: #fca5a5;
+      border-color: rgba(248,113,113,0.6);
+    }
+    .img-badge-status-pending,
+    .img-badge-status-playing {
+      background: rgba(148,163,184,0.12);
+      color: #9ca3af;
+      border-color: rgba(148,163,184,0.5);
+    }
+    .img-channel-actions {
+      display: flex;
+      gap: 4px;
+      justify-content: flex-end;
+      font-size: 11px;
+    }
+    .img-channel-actions button {
+      padding: 2px 6px;
+      border-radius: 999px;
+      border: 1px solid rgba(148,163,184,0.4);
+      background: transparent;
+      color: var(--muted);
+      font-size: 10px;
+      cursor: pointer;
+    }
+    .img-channel-actions button:hover {
+      background: rgba(148,163,184,0.16);
+      color: var(--text);
+    }
+    .img-card img {
+      width: 100%; height: 120px; object-fit: cover;
+      border-radius: 8px; background: #000;
+    }
+    .img-name { font-size: 12px; color: var(--muted); word-break: break-all; }
+    .badge-warn {
+      display: inline-block; padding: 4px 6px; border-radius: 6px;
+      background: rgba(248,113,113,0.18); color: #fca5a5; font-size: 11px;
+      border: 1px solid rgba(248,113,113,0.35);
+    }
+    .loading-overlay {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: rgba(15,23,42,0.75);
+      backdrop-filter: blur(2px);
+      z-index: 10;
+      color: var(--text);
+      font-size: 13px;
+      gap: 8px;
+    }
+    .spinner {
+      width: 16px;
+      height: 16px;
+      border-radius: 999px;
+      border: 2px solid rgba(148, 163, 184, 0.6);
+      border-top-color: var(--accent);
+      animation: spin 0.6s linear infinite;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+
+    /* Preview modal */
+    .modal {
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,0.72);
+      display: none;
+      justify-content: center;
+      align-items: center;
+      z-index: 9999;
+      padding: 20px;
+    }
+    .modal.open { display: flex; }
+    .modal-content {
+      position: relative;
+      max-width: 98vw;
+      max-height: 98vh;
+      background: #0b1220;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .modal img {
+      max-width: 94vw;
+      max-height: 82vh;
+      border-radius: 10px;
+      object-fit: contain;
+      background: #000;
+      cursor: zoom-in;
+      transition: max-width 0.2s, max-height 0.2s;
+    }
+    .modal img.zoomed {
+      cursor: zoom-out;
+    }
+    .modal-header {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 10px; color: var(--text); font-size: 14px;
+    }
+    .modal-actions { display: flex; gap: 8px; align-items: center; }
+    .nav-btn {
+      position: absolute;
+      top: 50%;
+      transform: translateY(-50%);
+      width: 36px; height: 36px;
+      border-radius: 50%;
+      border: 1px solid var(--border);
+      background: rgba(0,0,0,0.5);
+      color: var(--text);
+      cursor: pointer;
+    }
+    .nav-btn:hover { background: rgba(34,211,238,0.2); }
+    .nav-prev { left: -52px; }
+    .nav-next { right: -52px; }
+
+    /* Video modal */
+    .video-modal {
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,0.72);
+      display: none;
+      justify-content: center;
+      align-items: center;
+      z-index: 9999;
+      padding: 20px;
+    }
+    .video-modal.open { display: flex; }
+    .video-content {
+      position: relative;
+      max-width: 90vw;
+      max-height: 90vh;
+      background: #0b1220;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .video-actions { display:flex; gap:8px; align-items:center; }
+    #rtsp-player { width: 80vw; max-height: 70vh; background:#000; border-radius:10px; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: #0b1220;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow: hidden;
+    }
+    th, td {
+      padding: 10px 12px;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+      font-size: 13px;
+    }
+    th { color: var(--muted); background: rgba(255,255,255,0.02); }
+    tr:hover td { background: rgba(255,255,255,0.02); }
+    .tag { padding: 4px 8px; border-radius: 8px; font-size: 12px; font-weight: 500; }
+    /* 任务状态颜色 */
+    .tag.待运行, .tag.pending { background: rgba(156,163,175,0.2); color: #9ca3af; border: 1px solid rgba(156,163,175,0.3); }
+    .tag.运行中, .tag.playing { background: rgba(34,211,238,0.15); color: #22d3ee; border: 1px solid rgba(34,211,238,0.3); }
+    .tag.部分失败 { background: rgba(251,146,60,0.18); color: #fb923c; border: 1px solid rgba(251,146,60,0.3); }
+    .tag.完成, .tag.completed { background: rgba(16,185,129,0.18); color: #10b981; border: 1px solid rgba(16,185,129,0.3); }
+    /* 兼容旧的状态样式 */
+    .tag.screenshot_taken { background: rgba(16,185,129,0.18); color: #34d399; border: 1px solid rgba(16,185,129,0.3); }
+    .tag.failed { background: rgba(248,113,113,0.18); color: #fca5a5; border: 1px solid rgba(248,113,113,0.3); }
+    .tag.未开始 { background: rgba(156,163,175,0.2); color: #9ca3af; border: 1px solid rgba(156,163,175,0.3); }
+    .tag.已完成 { background: rgba(16,185,129,0.18); color: #10b981; border: 1px solid rgba(16,185,129,0.3); }
+    .tag.进行中 { background: rgba(34,211,238,0.15); color: #22d3ee; border: 1px solid rgba(34,211,238,0.3); }
+    
+    /* 优化的任务状态标签样式 */
+    .task-status-wrapper {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .task-status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 10px;
+      border-radius: 6px;
+      font-size: 12px;
+      font-weight: 500;
+      white-space: nowrap;
+      border: 1px solid;
+    }
+    .status-icon {
+      display: inline-block;
+      font-size: 14px;
+      font-weight: bold;
+      line-height: 1;
+    }
+    .status-icon-spin {
+      animation: spin 1s linear infinite;
+    }
+    @keyframes spin {
+      from { transform: rotate(0deg); }
+      to { transform: rotate(360deg); }
+    }
+    .status-text {
+      font-size: 12px;
+    }
+    .task-status-success {
+      background: rgba(16,185,129,0.15);
+      color: #10b981;
+      border-color: rgba(16,185,129,0.4);
+    }
+    .task-status-running {
+      background: rgba(34,211,238,0.15);
+      color: #22d3ee;
+      border-color: rgba(34,211,238,0.4);
+    }
+    .task-status-pending {
+      background: rgba(156,163,175,0.15);
+      color: #9ca3af;
+      border-color: rgba(156,163,175,0.4);
+    }
+    .task-status-failed {
+      background: rgba(248,113,113,0.15);
+      color: #f87171;
+      border-color: rgba(248,113,113,0.4);
+    }
+    .status-error-detail {
+      font-size: 11px;
+      color: #fca5a5;
+      padding: 4px 8px;
+      background: rgba(248,113,113,0.08);
+      border-radius: 4px;
+      max-width: 200px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      cursor: help;
+    }
+    .pager { display:flex; gap:10px; align-items:center; margin-top:10px; }
+    .pager button { padding: 8px 12px; }
+    .muted-inline { color: var(--muted); font-size: 13px; }
+    
+    /* Flatpickr 自定义样式 */
+    .flatpickr-calendar {
+      background: var(--card) !important;
+      border: 1px solid var(--border) !important;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.5) !important;
+    }
+    .flatpickr-months {
+      background: var(--panel) !important;
+      border-bottom: 1px solid var(--border) !important;
+    }
+    .flatpickr-month {
+      color: var(--text) !important;
+    }
+    .flatpickr-weekdays {
+      background: var(--panel) !important;
+    }
+    .flatpickr-weekday {
+      color: var(--muted) !important;
+    }
+    .flatpickr-day {
+      color: var(--text) !important;
+      border: 1px solid transparent !important;
+    }
+    .flatpickr-day:hover {
+      background: rgba(34,211,238,0.2) !important;
+      border-color: rgba(34,211,238,0.4) !important;
+    }
+    .flatpickr-day.selected {
+      background: var(--accent) !important;
+      border-color: var(--accent) !important;
+      color: #000 !important;
+    }
+    .flatpickr-day.today {
+      border-color: var(--accent-2) !important;
+    }
+    /* 有数据的日期标记 */
+    .flatpickr-day.has-data {
+      position: relative;
+    }
+    .flatpickr-day.has-data::after {
+      content: '✓';
+      position: absolute;
+      bottom: 3px;
+      right: 3px;
+      color: var(--accent-2);
+      font-size: 12px;
+      font-weight: bold;
+      line-height: 1;
+      z-index: 10;
+      background: rgba(16, 185, 129, 0.2);
+      border-radius: 50%;
+      width: 16px;
+      height: 16px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .flatpickr-day.has-data.selected::after {
+      color: #000;
+      background: rgba(255, 255, 255, 0.3);
+    }
+    .flatpickr-input {
+      background: rgba(0,0,0,0.3) !important;
+      border: 1px solid var(--border) !important;
+      color: var(--text) !important;
+      padding: 8px 12px !important;
+      border-radius: 6px !important;
+      cursor: pointer !important;
+    }
+    .flatpickr-input:focus {
+      border-color: var(--accent) !important;
+      outline: none !important;
+    }
+    /* 确保 Flatpickr 包装器可见 */
+    .flatpickr-wrapper {
+      position: relative;
+      display: inline-block;
+      width: 100%;
+    }
+    /* 日历图标按钮样式（如果使用） */
+    .flatpickr-calendar {
+      z-index: 9999 !important;
+    }
+    .link { color: #38bdf8; cursor: pointer; text-decoration: underline; }
+
+    .alert {
+      border: 1px solid rgba(248,113,113,0.3);
+      background: rgba(248,113,113,0.08);
+      color: #fecaca;
+      padding: 10px 12px;
+      border-radius: 10px;
+      font-size: 13px;
+    }
+    .info {
+      border: 1px solid rgba(34,211,238,0.25);
+      background: rgba(34,211,238,0.08);
+      color: #a5f3fc;
+      padding: 10px 12px;
+      border-radius: 10px;
+      font-size: 13px;
+    }
+  </style>
+  <!-- 静态文件版本号 - 每次部署时更新此版本号以清除浏览器缓存 -->
+  <script>
+    // 版本号格式：YYYYMMDDHHMM (年月日时分)
+    window.APP_VERSION = '202601301643';
+  </script>
+  <!-- 外部JavaScript文件（按依赖顺序加载，带版本号防止缓存） -->
+  <script src="/static/js/api.js?v=202601301643"></script>
+  <script src="/static/js/utils.js?v=202601301643"></script>
+  <script src="/static/js/dashboard.js?v=202601301643"></script>
+  <script src="/static/js/nvr-config.js?v=202601301643"></script>
+  <script src="/static/js/tasks.js?v=202601301643"></script>
+  <script src="/static/js/images.js?v=202601301643"></script>
+  <script src="/static/js/parking-changes.js?v=202601301643"></script>
+  <script src="/static/js/parking-changes-list.js?v=202601301643"></script>
+  <script src="/static/js/main.js?v=202601301643"></script>
+</head>
+<body>
+  <aside class="sidebar">
+    <div style="margin-bottom:14px;">
+      <div class="title">Smart RTSP</div>
+      <div class="subtitle">分片 · 截图 · 去重 · OCR</div>
+    </div>
+    <div id="nav-dashboard" class="nav-item active" onclick="switchView('dashboard')">基础参数配置</div>
+    <div id="nav-task-configs" class="nav-item" onclick="switchView('task-configs')">任务列表</div>
+    <div id="nav-tasks" class="nav-item" onclick="switchView('tasks')">任务列表详情</div>
+    <div id="nav-images" class="nav-item" onclick="switchView('images')">图片列表</div>
+    <div id="nav-parking-changes" class="nav-item" onclick="switchView('parking-changes')">车位变化</div>
+    <div id="nav-parking-changes-list" class="nav-item" onclick="switchView('parking-changes-list')">车位变化列表</div>
+    <div style="margin-top:18px;" class="muted">API: http://0.0.0.0:8005</div>
+    <div style="margin-top:16px; border-top:1px solid var(--border); padding-top:12px;">
+      <div class="muted-danger" style="margin-bottom:8px;">⚠ 管理操作（测试环境使用）：</div>
+      <button class="ghost" style="width:100%; margin-bottom:6px; border-color:#f97316; color:#fed7aa;"
+              onclick="handleClearAll()">
+        清空全部数据
+      </button>
+      <button class="ghost" style="width:100%; border-color:#ef4444; color:#fecaca;"
+              onclick="handleRedeploy()">
+        重新部署系统
+      </button>
+    </div>
+  </aside>
+
+  <div style="display:flex; flex-direction:column;">
+    <header>
+      <div>
+        <div class="title">Smart RTSP Stream Manager</div>
+        <div class="subtitle">10分钟分片 · 拉流 · 截图 · 去重 · OCR · 回放</div>
+      </div>
+      <div class="pill">Local UI</div>
+    </header>
+
+    <div class="container">
+      <!-- Dashboard -->
+      <div id="view-dashboard">
+        <!-- Tab切换 -->
+        <div class="card" style="margin-bottom:16px;">
+          <div style="display:flex; gap:10px; border-bottom:1px solid var(--border);">
+            <button id="tab-manual" class="ghost" style="border-bottom:2px solid var(--accent); padding:8px 16px;" onclick="switchTab('manual')">参数设置</button>
+            <button id="tab-auto" class="ghost" style="padding:8px 16px;" onclick="switchTab('auto')">自动分配配置</button>
+            <button id="tab-nvr-config" class="ghost" style="padding:8px 16px;" onclick="switchTab('nvr-config')">NVR配置</button>
+          </div>
+        </div>
+
+        <!-- 参数设置Tab -->
+        <div id="tab-content-manual" class="card">
+          <h3>参数设置</h3>
+          <div class="row">
+            <label>日期 (YYYY-MM-DD)</label>
+            <div style="display:flex; gap:10px; align-items:center;">
+              <input id="date" placeholder="YYYY-MM-DD" onkeydown="if(event.key==='Enter'){searchAll();}" />
+              <button class="ghost" onclick="searchAll()">搜索</button>
+            </div>
+          </div>
+          <div class="row">
+            <label>RTSP 基础地址</label>
+            <!-- 关闭浏览器自己的历史自动完成，只保留我们通过 datalist 提供的选项 -->
+            <input
+              id="base_rtsp"
+              list="base-rtsp-options"
+              placeholder="从NVR配置中选择或手动输入"
+              autocomplete="off"
+              spellcheck="false"
+            />
+            <datalist id="base-rtsp-options"></datalist>
+          </div>
+        <div class="row" style="display:none;">
+          <label>地址多选</label>
+          <div id="base-rtsp-checks" style="display:flex; flex-wrap:wrap; gap:10px;"></div>
+        </div>
+          <div class="row">
+            <label>通道选择</label>
+            <div style="display:flex; flex-direction:column; gap:8px;">
+              <div id="standard-channels-container" style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
+                <!-- 通道复选框将由JS根据NVR配置动态填充 -->
+              </div>
+              <div id="custom-channels-container" style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;"></div>
+              <div style="display:flex; gap:8px; align-items:center;">
+                <input id="custom-channel-input" placeholder="自定义通道（如: c5）" style="max-width:150px; font-size:12px;" onkeydown="if(event.key==='Enter'){addCustomChannel();}" />
+                <button class="ghost" style="font-size:12px; padding:4px 8px;" onclick="addCustomChannel()">添加</button>
+                <button class="ghost" style="font-size:12px; padding:4px 8px;" onclick="clearAllChannels()">清空选择</button>
+              </div>
+            </div>
+          </div>
+          <div class="row">
+            <label>间隔时间（分钟）</label>
+            <div style="display:flex; flex-direction:column; gap:8px;">
+              <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+                <button class="ghost interval-btn" data-interval="10" style="font-size:12px; padding:4px 12px;" onclick="setIntervalTime(10)">10</button>
+                <button class="ghost interval-btn" data-interval="15" style="font-size:12px; padding:4px 12px;" onclick="setIntervalTime(15)">15</button>
+                <button class="ghost interval-btn" data-interval="20" style="font-size:12px; padding:4px 12px;" onclick="setIntervalTime(20)">20</button>
+                <button class="ghost interval-btn" data-interval="30" style="font-size:12px; padding:4px 12px;" onclick="setIntervalTime(30)">30</button>
+                <button class="ghost interval-btn" data-interval="60" style="font-size:12px; padding:4px 12px;" onclick="setIntervalTime(60)">60</button>
+                <span style="color:var(--muted); font-size:12px;">或手动输入:</span>
+                <input id="interval" type="number" min="1" max="60" value="10" style="max-width:80px; font-size:12px;" onchange="updateIntervalButton()" />
+              </div>
+            </div>
+          </div>
+          <div class="row" style="display:none;">
+            <label>OCR 裁剪框</label>
+            <input id="crop" placeholder="示例: 0,0,320,80 (左上角时间区域)" />
+          </div>
+          <div class="btn-group">
+            <button onclick="createTasks()">生成任务</button>
+            <button class="secondary" style="display:none;" onclick="runTasks()">后台运行（拉流→截图→去重→OCR）</button>
+            <button class="ghost" onclick="gotoTasksFromDashboard()">查看任务</button>
+            <button class="ghost" style="display:none;" onclick="loadOCR()">查看 OCR</button>
+          </div>
+        <div class="row" style="margin-top:8px; display:none; gap:10px; align-items:center;">
+          <label style="min-width:120px;">自动当前日运行</label>
+          <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+            <label class="checkbox"><input type="checkbox" id="auto-use-now" checked /> 使用当前北京时间</label>
+            <button id="auto-run-btn" class="secondary" onclick="autoGenerateAndRun()">一键自动生成并运行</button>
+            <div class="muted-inline">勾选多个地址将依次生成并后台运行完成</div>
+          </div>
+        </div>
+          <div class="muted" style="margin-top:8px; display:none;">提示：首次运行 OCR 会下载模型，耗时较长。</div>
+        </div>
+
+        <!-- 自动分配配置Tab -->
+        <div id="tab-content-auto" class="card" style="display:none;">
+          <h3>自动分配配置</h3>
+          <div class="row">
+            <label>日期</label>
+            <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+              <label class="checkbox" style="display:flex; align-items:center; gap:6px;">
+                <input type="checkbox" id="auto-use-today" checked onchange="toggleAutoDate()" />
+                <span>自动获取当日时间</span>
+              </label>
+              <input id="auto-custom-date" type="date" style="max-width:180px;" disabled />
+            </div>
+          </div>
+          <div class="row">
+            <label>RTSP 基础地址</label>
+            <!-- 同样关闭自动分配配置里的浏览器历史自动完成 -->
+            <input
+              id="auto-base-rtsp"
+              list="auto-base-rtsp-options"
+              placeholder="从NVR配置中选择或手动输入"
+              autocomplete="off"
+              spellcheck="false"
+              onchange="previewAutoRule()"
+              oninput="previewAutoRule()"
+            />
+            <datalist id="auto-base-rtsp-options"></datalist>
+          </div>
+          <div class="row">
+            <label>通道选择</label>
+            <div style="display:flex; flex-direction:column; gap:8px;">
+              <div id="auto-standard-channels-container" style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
+                <!-- 自动分配配置的通道复选框由 JS 根据 /api/channels/by-base-rtsp 动态填充 -->
+              </div>
+              <div id="auto-custom-channels-container" style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;"></div>
+              <div style="display:flex; gap:8px; align-items:center;">
+                <input id="auto-custom-channel-input" placeholder="自定义通道（如: c5）" style="max-width:150px; font-size:12px;" onkeydown="if(event.key==='Enter'){addAutoCustomChannel();}" />
+                <button class="ghost" style="font-size:12px; padding:4px 8px;" onclick="addAutoCustomChannel()">添加</button>
+              </div>
+            </div>
+          </div>
+          <div class="row">
+            <label>间隔时间（分钟）</label>
+            <div style="display:flex; flex-direction:column; gap:8px;">
+              <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+                <button class="ghost auto-interval-btn" data-interval="10" style="font-size:12px; padding:4px 12px;" onclick="setAutoIntervalTime(10)">10</button>
+                <button class="ghost auto-interval-btn" data-interval="15" style="font-size:12px; padding:4px 12px;" onclick="setAutoIntervalTime(15)">15</button>
+                <button class="ghost auto-interval-btn" data-interval="20" style="font-size:12px; padding:4px 12px;" onclick="setAutoIntervalTime(20)">20</button>
+                <button class="ghost auto-interval-btn" data-interval="30" style="font-size:12px; padding:4px 12px;" onclick="setAutoIntervalTime(30)">30</button>
+                <button class="ghost auto-interval-btn" data-interval="60" style="font-size:12px; padding:4px 12px;" onclick="setAutoIntervalTime(60)">60</button>
+                <span style="color:var(--muted); font-size:12px;">或手动输入:</span>
+                <input id="auto-interval" type="number" min="1" max="60" value="10" style="max-width:80px; font-size:12px;" onchange="updateAutoIntervalButton(); previewAutoRule();" oninput="previewAutoRule()" />
+              </div>
+            </div>
+          </div>
+          <div class="row">
+            <label>触发时间</label>
+            <input id="auto-trigger-time" type="time" value="18:00" style="max-width:120px;" />
+          </div>
+          <div class="row">
+            <label>生成的数据预览</label>
+            <div id="auto-preview" style="background:#0b1220; border:1px solid var(--border); border-radius:8px; padding:12px; min-height:200px; max-height:400px; overflow-y:auto; font-family:monospace; font-size:12px; white-space:pre-wrap;"></div>
+          </div>
+          <div class="btn-group">
+            <button onclick="saveAutoRule()">保存</button>
+            <button class="ghost" onclick="previewAutoRule()">刷新预览</button>
+          </div>
+        </div>
+
+        <!-- 已保存的规则列表 -->
+        <!-- NVR配置Tab -->
+        <div id="tab-content-nvr-config" class="card" style="display:none;">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
+            <h3 style="margin:0;">NVR基础配置</h3>
+            <button class="secondary" onclick="showNvrConfigForm()" style="font-size:14px; padding:10px 20px;">
+              <span style="font-size:16px; margin-right:6px;">+</span> 新增NVR配置
+            </button>
+          </div>
+          
+          <!-- NVR配置列表 -->
+          <div id="nvr-config-list-container" style="margin-bottom:24px;">
+            <div id="nvr-config-list"></div>
+          </div>
+
+          <!-- NVR配置表单（新增/编辑） -->
+          <div id="nvr-config-form" style="display:none; border:2px solid var(--accent); border-radius:12px; padding:24px; margin-top:24px; background:rgba(34,211,238,0.05);">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; padding-bottom:12px; border-bottom:2px solid var(--accent);">
+              <div>
+                <h4 id="nvr-form-title" style="margin:0; color:var(--accent);">新增NVR配置</h4>
+                <div id="nvr-summary-bar" class="muted" style="font-size:12px; margin-top:6px; display:none;"></div>
+              </div>
+              <button class="ghost" onclick="cancelNvrConfigForm()" style="font-size:12px; padding:6px 12px;">✕ 取消</button>
+            </div>
+            
+            <!-- 表单分为两列布局 -->
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:24px; margin-bottom:24px;">
+              <!-- 左侧：NVR基本信息 -->
+              <div>
+                <h5 style="margin:0 0 16px 0; color:var(--text); font-size:15px; padding-bottom:8px; border-bottom:1px solid var(--border);">NVR基本信息</h5>
+                
+                <div class="row">
+                  <label>NVR IP地址 *</label>
+                  <input id="nvr-ip" type="text" placeholder="例如: 10.10.11.122" oninput="syncNvrIpToDbHost()" />
+                </div>
+                
+                <div class="row">
+                  <label>车场名称 *</label>
+                  <input id="nvr-parking-name" type="text" placeholder="例如: 高新路30号车场" />
+                </div>
+                
+                <div class="row">
+                  <label>NVR账号 *</label>
+                  <input id="nvr-username" type="text" placeholder="例如: admin" />
+                </div>
+                
+                <div class="row">
+                  <label>NVR密码 *</label>
+                  <input id="nvr-password" type="password" placeholder="例如: admin123=" />
+                </div>
+                
+                <div class="row">
+                  <label>NVR端口 *</label>
+                  <input id="nvr-port" type="number" value="554" placeholder="例如: 554" />
+                </div>
+              </div>
+              
+              <!-- 右侧：数据库连接信息 -->
+              <div>
+                <h5 style="margin:0 0 16px 0; color:var(--text); font-size:15px; padding-bottom:8px; border-bottom:1px solid var(--border);">数据库连接信息</h5>
+                <div class="muted" style="font-size:12px; margin-bottom:16px; padding:8px; background:rgba(34,211,238,0.08); border-radius:6px; border-left:3px solid var(--accent);">
+                  用于查询车位坐标，通常数据库地址与NVR IP地址相同
+                </div>
+                
+                <div class="row">
+                  <label>数据库地址</label>
+                  <input id="nvr-db-host" type="text" placeholder="例如: 10.10.11.122" />
+                </div>
+                
+                <div class="row">
+                  <label>数据库账号</label>
+                  <input id="nvr-db-user" type="text" placeholder="例如: root" />
+                </div>
+                
+                <div class="row">
+                  <label>数据库密码</label>
+                  <input id="nvr-db-password" type="password" placeholder="例如: 123" />
+                </div>
+                
+                <div class="row">
+                  <label>数据库端口</label>
+                  <input id="nvr-db-port" type="number" value="3306" placeholder="例如: 3306" />
+                </div>
+                
+                <div class="row">
+                  <label>数据库名称</label>
+                  <input id="nvr-db-name" type="text" placeholder="例如: parking_mng_db" />
+                </div>
+              </div>
+            </div>
+
+            <!-- 通道配置区域 -->
+            <div style="margin-top:24px; padding-top:24px; border-top:2px solid var(--accent);">
+              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+                <div>
+                  <h4 style="margin:0 0 4px 0; color:var(--accent);">通道配置 *</h4>
+                  <div class="muted" style="font-size:12px;">请至少添加一个通道配置（所属通道、摄像头IP、名称、SN等）</div>
+                </div>
+                <button class="secondary" onclick="addChannelConfig()" style="font-size:13px; padding:8px 16px;">
+                  <span style="font-size:16px; margin-right:4px;">+</span> 添加通道
+                </button>
+              </div>
+              <div id="channel-config-list"></div>
+            </div>
+
+            <div class="btn-group" style="margin-top:24px; padding-top:20px; border-top:1px solid var(--border);">
+              <button onclick="saveNvrConfig()" style="font-size:14px; padding:10px 24px;">保存配置</button>
+              <button class="ghost" onclick="cancelNvrConfigForm()" style="font-size:14px; padding:10px 24px;">取消</button>
+            </div>
+          </div>
+        </div>
+
+        <div id="tab-content-auto-rules" class="card" style="display:none; margin-top:16px;">
+          <h3>已保存的规则</h3>
+          <div id="auto-rules-list"></div>
+        </div>
+
+      </div>
+
+      <!-- Task Configs View -->
+      <div id="view-task-configs" style="display:none;">
+        <div class="card">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+            <h3>任务列表</h3>
+            <div style="display:flex; align-items:center; gap:8px;">
+              <button class="ghost" onclick="toggleAdvancedSearch('config')" style="font-size:12px;">高级搜索 ▼</button>
+              <button class="ghost" onclick="resetConfigSearch()" style="font-size:12px;">重置</button>
+            </div>
+          </div>
+          
+          <!-- 基础搜索区域 -->
+          <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:10px; padding:10px; background:rgba(0,0,0,0.02); border-radius:4px;">
+            <input id="config-date" style="max-width:140px" list="config-date-options" placeholder="日期 YYYY-MM-DD" autocomplete="off" onkeydown="if(event.key==='Enter'){loadTaskConfigs();}" />
+            <datalist id="config-date-options"></datalist>
+            <div style="display:flex; align-items:center; gap:4px;">
+              <select id="config-ip" style="max-width:150px; padding:4px 8px;">
+                <option value="">全部IP</option>
+              </select>
+              <select id="config-ip-mode" style="max-width:60px; padding:4px 2px; font-size:11px;">
+                <option value="eq">精准</option>
+                <option value="like">模糊</option>
+              </select>
+            </div>
+            <div style="display:flex; align-items:center; gap:4px;">
+              <select id="config-channel" style="max-width:120px; padding:4px 8px;">
+                <option value="">全部通道</option>
+              </select>
+              <select id="config-channel-mode" style="max-width:60px; padding:4px 2px; font-size:11px;">
+                <option value="eq">精准</option>
+                <option value="like">模糊</option>
+              </select>
+            </div>
+            <select id="config-status" style="max-width:120px; padding:4px 8px;">
+              <option value="">全部状态</option>
+              <option value="待运行">待运行</option>
+              <option value="运行中">运行中</option>
+              <option value="完成">完成</option>
+              <option value="部分失败">部分失败</option>
+            </select>
+            <button class="ghost" onclick="loadTaskConfigs()">搜索</button>
+          </div>
+          
+          <!-- 高级搜索区域（可折叠） -->
+          <div id="config-advanced-search" style="display:none; margin-bottom:10px; padding:10px; background:rgba(0,0,0,0.02); border-radius:4px;">
+            <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); gap:8px; margin-bottom:8px;">
+              <div>
+                <label style="font-size:12px; color:#666;">日期（模糊）</label>
+                <input id="config-date-like" style="width:100%; font-size:12px; padding:4px;" placeholder="如: 2025-12" />
+              </div>
+              <div>
+                <label style="font-size:12px; color:#666;">RTSP基础地址（模糊）</label>
+                <input id="config-rtsp-like" style="width:100%; font-size:12px; padding:4px;" placeholder="模糊搜索RTSP地址" />
+              </div>
+              <div>
+                <label style="font-size:12px; color:#666;">开始时间戳范围</label>
+                <div style="display:flex; gap:4px;">
+                  <input id="config-start-ts-gte" type="number" style="flex:1; font-size:12px; padding:4px;" placeholder=">= 开始时间戳" />
+                  <input id="config-start-ts-lte" type="number" style="flex:1; font-size:12px; padding:4px;" placeholder="<= 开始时间戳" />
+                </div>
+              </div>
+              <div>
+                <label style="font-size:12px; color:#666;">结束时间戳范围</label>
+                <div style="display:flex; gap:4px;">
+                  <input id="config-end-ts-gte" type="number" style="flex:1; font-size:12px; padding:4px;" placeholder=">= 结束时间戳" />
+                  <input id="config-end-ts-lte" type="number" style="flex:1; font-size:12px; padding:4px;" placeholder="<= 结束时间戳" />
+                </div>
+              </div>
+              <div>
+                <label style="font-size:12px; color:#666;">间隔分钟数范围</label>
+                <div style="display:flex; gap:4px;">
+                  <input id="config-interval-gte" type="number" style="flex:1; font-size:12px; padding:4px;" placeholder=">= 间隔分钟" />
+                  <input id="config-interval-lte" type="number" style="flex:1; font-size:12px; padding:4px;" placeholder="<= 间隔分钟" />
+                </div>
+              </div>
+              <div>
+                <label style="font-size:12px; color:#666;">操作时间范围</label>
+                <div style="display:flex; gap:4px;">
+                  <input id="config-op-time-gte" type="datetime-local" style="flex:1; font-size:12px; padding:4px;" />
+                  <input id="config-op-time-lte" type="datetime-local" style="flex:1; font-size:12px; padding:4px;" />
+                </div>
+              </div>
+              <div>
+                <label style="font-size:12px; color:#666;">状态多选（逗号分隔）</label>
+                <input id="config-status-in" style="width:100%; font-size:12px; padding:4px;" placeholder="如: 完成,部分失败" />
+              </div>
+            </div>
+          </div>
+          
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+            <div class="muted" style="font-size:12px;">展示字段：序号、开始时间、结束时间、RTSP基础地址、通道、间隔(分钟)、任务状态、操作时间、操作</div>
+            <div class="pager" id="config-pager" style="display:none;">
+              <span class="muted-inline">每页显示：</span>
+              <select id="config-page-size" style="max-width:80px; padding:4px 8px;" onchange="configPage=1; loadTaskConfigs();">
+                <option value="10">10</option>
+                <option value="20" selected>20</option>
+                <option value="30">30</option>
+                <option value="50">50</option>
+              </select>
+              <button id="config-prev" class="ghost" onclick="prevConfigPage()">上一页</button>
+              <span class="muted-inline" id="config-page-info">第 1 页</span>
+              <button id="config-next" class="ghost" onclick="nextConfigPage()">下一页</button>
+            </div>
+          </div>
+          <div id="task-configs-table-wrap"></div>
+        </div>
+      </div>
+
+      <!-- Tasks View -->
+      <div id="view-tasks" style="display:none;">
+        <div class="card">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+            <h3>任务列表详情</h3>
+            <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+              <button class="ghost" onclick="toggleAdvancedSearch('tasks')" style="font-size:12px;">高级搜索 ▼</button>
+              <button class="ghost" onclick="resetTaskSearch()" style="font-size:12px;">重置</button>
+            </div>
+          </div>
+          
+          <!-- 基础搜索区域 -->
+          <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:10px; padding:10px; background:rgba(0,0,0,0.02); border-radius:4px;">
+            <input id="task-date" style="max-width:140px" list="task-date-options" placeholder="日期 YYYY-MM-DD" autocomplete="off" onkeydown="if(event.key==='Enter'){searchTasks();}" />
+            <datalist id="task-date-options"></datalist>
+            <input id="task-search-name" style="max-width:150px" placeholder="截图文件名" onkeydown="if(event.key==='Enter'){searchTasks();}" />
+            <input id="task-search-id" type="hidden" />
+            <div style="display:flex; align-items:center; gap:4px;">
+              <select id="task-search-ip" style="max-width:150px; padding:4px 8px;">
+                <option value="">全部IP</option>
+              </select>
+              <select id="task-ip-mode" style="max-width:60px; padding:4px 2px; font-size:11px;">
+                <option value="eq">精准</option>
+                <option value="like">模糊</option>
+              </select>
+            </div>
+            <div style="display:flex; align-items:center; gap:4px;">
+              <select id="task-search-channel" style="max-width:120px; padding:4px 8px;">
+                <option value="">全部通道</option>
+              </select>
+              <select id="task-channel-mode" style="max-width:60px; padding:4px 2px; font-size:11px;">
+                <option value="eq">精准</option>
+                <option value="like">模糊</option>
+              </select>
+            </div>
+            <select id="task-status" style="max-width:120px; padding:4px 8px;">
+              <option value="">全部状态</option>
+              <option value="pending">待运行</option>
+              <option value="playing">运行中</option>
+              <option value="completed">完成</option>
+              <option value="failed">失败</option>
+            </select>
+            <button class="ghost" onclick="searchTasks()">搜索</button>
+          </div>
+          
+          <!-- 高级搜索区域（可折叠） -->
+          <div id="task-advanced-search" style="display:none; margin-bottom:10px; padding:10px; background:rgba(0,0,0,0.02); border-radius:4px;">
+            <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); gap:8px; margin-bottom:8px;">
+              <div>
+                <label style="font-size:12px; color:#666;">截图文件名</label>
+                <div style="display:flex; gap:4px;">
+                  <input id="task-name-eq" style="flex:1; font-size:12px; padding:4px;" placeholder="精准搜索" />
+                  <input id="task-name-like" style="flex:1; font-size:12px; padding:4px;" placeholder="模糊搜索" />
+                </div>
+              </div>
+              <div>
+                <label style="font-size:12px; color:#666;">RTSP地址</label>
+                <div style="display:flex; gap:4px;">
+                  <input id="task-rtsp-eq" style="flex:1; font-size:12px; padding:4px;" placeholder="精准搜索" />
+                  <input id="task-rtsp-like" style="flex:1; font-size:12px; padding:4px;" placeholder="模糊搜索" />
+                </div>
+              </div>
+              <div>
+                <label style="font-size:12px; color:#666;">开始时间戳范围</label>
+                <div style="display:flex; gap:4px;">
+                  <input id="task-start-ts-gte" type="number" style="flex:1; font-size:12px; padding:4px;" placeholder=">= 开始时间戳" />
+                  <input id="task-start-ts-lte" type="number" style="flex:1; font-size:12px; padding:4px;" placeholder="<= 开始时间戳" />
+                </div>
+              </div>
+              <div>
+                <label style="font-size:12px; color:#666;">结束时间戳范围</label>
+                <div style="display:flex; gap:4px;">
+                  <input id="task-end-ts-gte" type="number" style="flex:1; font-size:12px; padding:4px;" placeholder=">= 结束时间戳" />
+                  <input id="task-end-ts-lte" type="number" style="flex:1; font-size:12px; padding:4px;" placeholder="<= 结束时间戳" />
+                </div>
+              </div>
+              <div>
+                <label style="font-size:12px; color:#666;">操作时间范围</label>
+                <div style="display:flex; gap:4px;">
+                  <input id="task-op-time-gte" type="datetime-local" style="flex:1; font-size:12px; padding:4px;" />
+                  <input id="task-op-time-lte" type="datetime-local" style="flex:1; font-size:12px; padding:4px;" />
+                </div>
+              </div>
+              <div>
+                <label style="font-size:12px; color:#666;">状态多选（逗号分隔）</label>
+                <input id="task-status-in" style="width:100%; font-size:12px; padding:4px;" placeholder="如: pending,playing,completed" />
+              </div>
+              <div>
+                <label style="font-size:12px; color:#666;">错误信息（模糊）</label>
+                <input id="task-error-like" style="width:100%; font-size:12px; padding:4px;" placeholder="模糊搜索错误信息" />
+              </div>
+            </div>
+          </div>
+          
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+            <div class="muted" style="font-size:12px;">展示字段：序号、起止时间（可读+时间戳）、状态（中文）、截图文件名、视频流地址、操作时间、操作</div>
+            <div class="pager">
+              <span class="muted-inline">每页显示：</span>
+              <select id="task-page-size" style="max-width:80px; padding:4px 8px;" onchange="taskPage=1; searchTasks();">
+                <option value="10">10</option>
+                <option value="20" selected>20</option>
+                <option value="30">30</option>
+                <option value="50">50</option>
+              </select>
+              <button id="task-prev" class="ghost" onclick="prevPage()">上一页</button>
+              <span class="muted-inline" id="task-page-info">第 1 页</span>
+              <button id="task-next" class="ghost" onclick="nextPage()">下一页</button>
+            </div>
+          </div>
+          <div id="tasks-table-wrap"></div>
+        </div>
+      </div>
+
+      <!-- Images View -->
+      <div id="view-images" style="display:none;">
+        <div class="card">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+            <h3>图片列表（每10分钟截图）</h3>
+            <div style="display:flex; align-items:center; gap:8px;">
+              <button class="ghost" onclick="toggleAdvancedSearch('img')" style="font-size:12px;">高级搜索 ▼</button>
+              <button class="ghost" onclick="resetImageSearch()" style="font-size:12px;">重置</button>
+            </div>
+          </div>
+          
+          <!-- 基础搜索区域 -->
+          <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:10px; padding:10px; background:rgba(0,0,0,0.02); border-radius:4px;">
+            <input id="img-date" style="max-width:140px" list="date-options" placeholder="日期 YYYY-MM-DD" autocomplete="off" onkeydown="if(event.key==='Enter'){searchImages();}" />
+            <datalist id="date-options"></datalist>
+            <div style="display:flex; align-items:center; gap:4px;">
+              <select id="img-search-ip" style="max-width:150px; padding:4px 8px;">
+                <option value="">全部IP</option>
+              </select>
+              <select id="img-ip-mode" style="max-width:60px; padding:4px 2px; font-size:11px;">
+                <option value="eq">精准</option>
+                <option value="like">模糊</option>
+              </select>
+            </div>
+            <div style="display:flex; align-items:center; gap:4px;">
+              <select id="img-search-channel" style="max-width:120px; padding:4px 8px;">
+                <option value="">全部通道</option>
+              </select>
+              <select id="img-channel-mode" style="max-width:60px; padding:4px 2px; font-size:11px;">
+                <option value="eq">精准</option>
+                <option value="like">模糊</option>
+              </select>
+            </div>
+            <select id="img-task-status" style="max-width:120px; padding:4px 8px;">
+              <option value="">全部状态</option>
+              <option value="pending">待运行</option>
+              <option value="playing">运行中</option>
+              <option value="completed">完成</option>
+              <option value="failed">失败</option>
+            </select>
+            <button class="ghost" onclick="searchImages()">搜索</button>
+          </div>
+          
+          <!-- 高级搜索区域（可折叠） -->
+          <div id="img-advanced-search" style="display:none; margin-bottom:10px; padding:10px; background:rgba(0,0,0,0.02); border-radius:4px;">
+            <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); gap:8px; margin-bottom:8px;">
+              <div>
+                <label style="font-size:12px; color:#666;">图片名称</label>
+                <div style="display:flex; gap:4px;">
+                  <input id="img-name-eq" style="flex:1; font-size:12px; padding:4px;" placeholder="精准搜索" />
+                  <input id="img-name-like" style="flex:1; font-size:12px; padding:4px;" placeholder="模糊搜索" />
+                </div>
+              </div>
+              <div>
+                <label style="font-size:12px; color:#666;">任务开始时间戳范围</label>
+                <div style="display:flex; gap:4px;">
+                  <input id="img-start-ts-gte" type="number" style="flex:1; font-size:12px; padding:4px;" placeholder=">= 开始时间戳" />
+                  <input id="img-start-ts-lte" type="number" style="flex:1; font-size:12px; padding:4px;" placeholder="<= 开始时间戳" />
+                </div>
+              </div>
+              <div>
+                <label style="font-size:12px; color:#666;">任务结束时间戳范围</label>
+                <div style="display:flex; gap:4px;">
+                  <input id="img-end-ts-gte" type="number" style="flex:1; font-size:12px; padding:4px;" placeholder=">= 结束时间戳" />
+                  <input id="img-end-ts-lte" type="number" style="flex:1; font-size:12px; padding:4px;" placeholder="<= 结束时间戳" />
+                </div>
+              </div>
+              <div>
+                <label style="font-size:12px; color:#666;">任务状态多选（逗号分隔）</label>
+                <input id="img-task-status-in" style="width:100%; font-size:12px; padding:4px;" placeholder="如: completed,failed" />
+              </div>
+              <div>
+                <label style="font-size:12px; color:#666;">状态标签</label>
+                <select id="img-status-label" style="width:100%; font-size:12px; padding:4px;">
+                  <option value="">全部标签</option>
+                  <option value="待截图">待截图</option>
+                  <option value="截图中">截图中</option>
+                  <option value="截图失败">截图失败</option>
+                  <option value="文件缺失">文件缺失</option>
+                </select>
+              </div>
+              <div>
+                <label style="font-size:12px; color:#666;">状态标签多选（逗号分隔）</label>
+                <input id="img-status-label-in" style="width:100%; font-size:12px; padding:4px;" placeholder="如: 待截图,截图中" />
+              </div>
+              <div>
+                <label style="font-size:12px; color:#666;">是否缺失</label>
+                <select id="img-missing" style="width:100%; font-size:12px; padding:4px;">
+                  <option value="">全部</option>
+                  <option value="false">文件存在</option>
+                  <option value="true">文件缺失</option>
+                </select>
+              </div>
+            </div>
+          </div>
+          
+          <!-- 通道变化概览区域 -->
+          <div id="img-channel-overview" style="display:none; margin-bottom:16px; padding:12px; background:rgba(15,23,42,0.5); border-radius:8px; border:1px solid rgba(148,163,184,0.2);">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+              <h4 style="margin:0; font-size:14px; color:#e5e7eb;">通道变化概览</h4>
+              <button class="ghost" onclick="toggleChannelOverview()" style="font-size:11px; padding:4px 8px;">收起 ▲</button>
+            </div>
+            <div id="img-channel-overview-content" style="display:grid; grid-template-columns:repeat(auto-fill, minmax(200px, 1fr)); gap:8px;">
+              <!-- 动态生成通道卡片 -->
+            </div>
+          </div>
+          
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+            <div id="img-msg" class="muted">图片来自 /shots/{date}/，需先完成截图任务。</div>
+            <div style="display:flex; align-items:center; gap:8px;">
+              <button class="ghost" onclick="toggleChannelOverview()" style="font-size:12px; padding:4px 8px;">通道概览 ▼</button>
+              <button id="img-filter-changes" class="ghost" onclick="toggleImageChangeFilter()" style="font-size:12px; padding:4px 8px;">只显示有变化</button>
+            </div>
+          </div>
+          <div class="img-container">
+            <div id="img-loading" class="loading-overlay" style="display:none;">
+              <div class="spinner"></div>
+              <span>正在加载图片，请稍候...</span>
+            </div>
+            <div id="img-grid" class="img-grid"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Parking Changes View -->
+      <div id="view-parking-changes" style="display:none;">
+        <div class="card">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+            <h3>车位变化列表</h3>
+            <div style="display:flex; align-items:center; gap:8px;">
+              <button class="ghost" onclick="toggleAdvancedSearch('pc')" style="font-size:12px;">高级搜索 ▼</button>
+              <button class="ghost" onclick="resetParkingChangeSearch()" style="font-size:12px;">重置</button>
+            </div>
+          </div>
+          
+          <!-- 基础搜索区域 -->
+          <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:10px; padding:10px; background:rgba(0,0,0,0.02); border-radius:4px;">
+            <input id="pc-date" style="max-width:140px" list="pc-date-options" placeholder="日期 YYYY-MM-DD" autocomplete="off"
+                   onkeydown="if(event.key==='Enter'){searchParkingChanges();}" />
+            <datalist id="pc-date-options"></datalist>
+            <div style="display:flex; align-items:center; gap:4px;">
+              <select id="pc-search-ip" style="max-width:150px; padding:4px 8px;">
+                <option value="">全部IP</option>
+              </select>
+              <select id="pc-ip-mode" style="max-width:60px; padding:4px 2px; font-size:11px;">
+                <option value="eq">精准</option>
+                <option value="like">模糊</option>
+              </select>
+            </div>
+            <div style="display:flex; align-items:center; gap:4px;">
+              <select id="pc-search-channel" style="max-width:120px; padding:4px 8px;">
+                <option value="">全部通道</option>
+              </select>
+              <select id="pc-channel-mode" style="max-width:60px; padding:4px 2px; font-size:11px;">
+                <option value="eq">精准</option>
+                <option value="like">模糊</option>
+              </select>
+            </div>
+            <input id="pc-parking-name" style="max-width:180px" placeholder="车场名称（模糊）" autocomplete="off"
+                   onkeydown="if(event.key==='Enter'){searchParkingChanges();}" />
+            <select id="pc-task-status" style="max-width:120px; padding:4px 8px;">
+              <option value="">全部状态</option>
+              <option value="pending">待运行</option>
+              <option value="playing">运行中</option>
+              <option value="completed">完成</option>
+              <option value="failed">失败</option>
+            </select>
+            <select id="pc-change-type" style="max-width:120px; padding:4px 8px;">
+              <option value="">全部类型</option>
+              <option value="arrive">进车</option>
+              <option value="leave">离开</option>
+            </select>
+            <button class="ghost" onclick="searchParkingChanges()">搜索</button>
+          </div>
+          
+          <!-- 高级搜索区域（可折叠） -->
+          <div id="pc-advanced-search" style="display:none; margin-bottom:10px; padding:10px; background:rgba(0,0,0,0.02); border-radius:4px;">
+            <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); gap:8px; margin-bottom:8px;">
+              <div>
+                <label style="font-size:12px; color:#666;">图片名称</label>
+                <div style="display:flex; gap:4px;">
+                  <input id="pc-name-eq" style="flex:1; font-size:12px; padding:4px;" placeholder="精准搜索" />
+                  <input id="pc-name-like" style="flex:1; font-size:12px; padding:4px;" placeholder="模糊搜索" />
+                </div>
+              </div>
+              <div>
+                <label style="font-size:12px; color:#666;">车位编号（模糊）</label>
+                <input id="pc-space-name" style="width:100%; font-size:12px; padding:4px;" placeholder="如: GXSL091" />
+              </div>
+              <div>
+                <label style="font-size:12px; color:#666;">任务开始时间戳范围</label>
+                <div style="display:flex; gap:4px;">
+                  <input id="pc-start-ts-gte" type="number" style="flex:1; font-size:12px; padding:4px;" placeholder=">= 开始时间戳" />
+                  <input id="pc-start-ts-lte" type="number" style="flex:1; font-size:12px; padding:4px;" placeholder="<= 开始时间戳" />
+                </div>
+              </div>
+              <div>
+                <label style="font-size:12px; color:#666;">任务结束时间戳范围</label>
+                <div style="display:flex; gap:4px;">
+                  <input id="pc-end-ts-gte" type="number" style="flex:1; font-size:12px; padding:4px;" placeholder=">= 结束时间戳" />
+                  <input id="pc-end-ts-lte" type="number" style="flex:1; font-size:12px; padding:4px;" placeholder="<= 结束时间戳" />
+                </div>
+              </div>
+              <div>
+                <label style="font-size:12px; color:#666;">任务状态多选（逗号分隔）</label>
+                <input id="pc-task-status-in" style="width:100%; font-size:12px; padding:4px;" placeholder="如: completed,failed" />
+              </div>
+              <div>
+                <label style="font-size:12px; color:#666;">状态标签</label>
+                <select id="pc-status-label" style="width:100%; font-size:12px; padding:4px;">
+                  <option value="">全部标签</option>
+                  <option value="待截图">待截图</option>
+                  <option value="截图中">截图中</option>
+                  <option value="截图失败">截图失败</option>
+                  <option value="文件缺失">文件缺失</option>
+                </select>
+              </div>
+              <div>
+                <label style="font-size:12px; color:#666;">状态标签多选（逗号分隔）</label>
+                <input id="pc-status-label-in" style="width:100%; font-size:12px; padding:4px;" placeholder="如: 待截图,截图中" />
+              </div>
+              <div>
+                <label style="font-size:12px; color:#666;">是否缺失</label>
+                <select id="pc-missing" style="width:100%; font-size:12px; padding:4px;">
+                  <option value="">全部</option>
+                  <option value="false">文件存在</option>
+                  <option value="true">文件缺失</option>
+                </select>
+              </div>
+            </div>
+          </div>
+          
+          <div id="pc-msg" class="muted" style="font-size:12px; margin-bottom:8px;">请先点击“搜索”加载车位变化数据。</div>
+          <!-- 按通道分组的对比图展示区域 -->
+          <div id="pc-grouped-view" style="display:flex; flex-direction:column; gap:20px;">
+            <!-- 动态生成通道分组 -->
+          </div>
+        </div>
+      </div>
+
+      <!-- Parking Changes List View (按车位分组) -->
+      <div id="view-parking-changes-list" style="display:none;">
+        <div class="card">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+            <h3>车位变化列表</h3>
+            <div style="display:flex; align-items:center; gap:8px;">
+              <button class="ghost" onclick="toggleAdvancedSearch('pcl')" style="font-size:12px;">高级搜索 ▼</button>
+              <button class="ghost" onclick="resetParkingChangeListSearch()" style="font-size:12px;">重置</button>
+            </div>
+          </div>
+          
+          <!-- 基础搜索区域 -->
+          <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:16px; padding:12px; background:rgba(0,0,0,0.02); border-radius:8px;">
+            <input id="pcl-date" style="max-width:140px" list="pcl-date-options" placeholder="日期 YYYY-MM-DD" autocomplete="off"
+                   onkeydown="if(event.key==='Enter'){loadParkingChangeList();}" />
+            <datalist id="pcl-date-options"></datalist>
+            <div style="display:flex; align-items:center; gap:4px;">
+              <select id="pcl-search-ip" style="min-width:120px;">
+                <option value="">全部IP</option>
+              </select>
+              <select id="pcl-ip-mode" style="width:80px;">
+                <option value="eq">精准</option>
+                <option value="like">模糊</option>
+              </select>
+            </div>
+            <div style="display:flex; align-items:center; gap:4px;">
+              <select id="pcl-search-channel" style="min-width:100px;">
+                <option value="">全部通道</option>
+              </select>
+              <select id="pcl-channel-mode" style="width:80px;">
+                <option value="eq">精准</option>
+                <option value="like">模糊</option>
+              </select>
+            </div>
+            <input id="pcl-parking-name" placeholder="车场名称（模糊）" style="min-width:150px;" />
+            <select id="pcl-task-status" style="min-width:100px;">
+              <option value="">全部状态</option>
+              <option value="pending">待运行</option>
+              <option value="running">运行中</option>
+              <option value="completed">完成</option>
+              <option value="failed">失败</option>
+            </select>
+            <select id="pcl-change-type" style="min-width:100px;">
+              <option value="">全部类型</option>
+              <option value="arrive">进车</option>
+              <option value="leave">离开</option>
+            </select>
+            <input id="pcl-space-name" placeholder="车位编号（模糊）" style="min-width:120px;" />
+            <button class="ghost" onclick="loadParkingChangeList()">搜索</button>
+          </div>
+          
+          <div id="pcl-msg" style="margin-bottom:12px; color:#9ca3af; font-size:13px;"></div>
+          <div id="pcl-grouped-view"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 内联JavaScript代码已迁移到外部文件，请查看 /static/js/ 目录 -->
+  <!-- 所有JavaScript代码已拆分到以下文件：
+       - /static/js/api.js (API调用封装)
+       - /static/js/utils.js (工具函数)
+       - /static/js/dashboard.js (基础参数配置)
+       - /static/js/nvr-config.js (NVR配置)
+       - /static/js/tasks.js (任务列表)
+       - /static/js/images.js (图片列表)
+       - /static/js/main.js (初始化代码)
+  -->
+  <script>
+    // 注意：所有JavaScript代码已迁移到外部文件
+    // 如果需要添加新的内联代码，请考虑将其添加到对应的外部JS文件中
+    // 此script标签保留为空，所有功能代码已迁移到 /static/js/ 目录下的独立文件
+    // 所有函数定义已迁移，请勿在此处添加代码
+      
+    // 所有JavaScript代码已迁移到外部文件，此script标签保留为空
+  </script>
+
+  <!-- Image Preview Modal -->
+  <div class="modal" id="img-modal" onclick="if(event.target.id==='img-modal') closePreview();">
+    <div class="modal-content">
+      <div class="modal-header">
+        <div id="modal-title">图片预览</div>
+        <div class="modal-actions">
+          <button class="ghost" onclick="showDetectedImage()">查看车位图</button>
+          <button class="ghost" onclick="viewOrderPage()">查看订单</button>
+          <button class="ghost" onclick="jumpToTaskFromImage()">查看任务</button>
+          <button class="ghost" onclick="copyFilename()">复制文件名</button>
+          <button class="ghost" onclick="closePreview()">关闭</button>
+        </div>
+      </div>
+      <!-- 左图右信息，两列布局：左侧约 3/4 宽用于大图，右侧约 1/4 宽用于文字信息 -->
+      <div class="modal-body">
+        <!-- 左侧：图片显示区域 -->
+        <div class="modal-image-container">
+          <!-- 左右按钮：点击切换上一张/下一张 -->
+          <button class="nav-btn nav-prev" onclick="prevPreview(); event.stopPropagation();" title="上一张">‹</button>
+          <!-- 点击图片：左三分之一=上一张，中间=关闭，右三分之一=下一张；使用 contain 保证整张图完整可见 -->
+          <img
+            id="modal-img"
+            src=""
+            alt="preview"
+            onclick="toggleImageZoom(event); event.stopPropagation();"
+          />
+          <button class="nav-btn nav-next" onclick="nextPreview(); event.stopPropagation();" title="下一张">›</button>
+        </div>
+        <!-- 右侧：图片信息区域 -->
+        <div id="modal-info" style="display:flex; flex-direction:column; gap:12px; overflow-y:auto; padding-right:8px;">
+          <!-- 信息将通过JavaScript动态填充 -->
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Video Modal -->
+  <div class="video-modal" id="video-modal" onclick="if(event.target.id==='video-modal') closeVideoModal();">
+    <div class="video-content">
+      <div class="modal-header">
+        <div id="video-title">视频播放</div>
+        <div class="video-actions">
+          <a id="video-link" href="#" target="_blank" class="link" style="font-size:12px;">m3u8</a>
+          <button class="ghost" onclick="(function(){const v=document.getElementById('rtsp-player');const l=document.getElementById('video-link');if(v&&v.src){v.play().catch(()=>{ if(l&&l.href) window.open(l.href,'_blank');});}else if(l&&l.href){window.open(l.href,'_blank');}})()">手动播放</button>
+          <button class="ghost" onclick="closeVideoModal()">关闭</button>
+        </div>
+      </div>
+      <div class="video-body">
+        <div class="video-player-container">
+      <video id="rtsp-player" controls muted playsinline></video>
+        </div>
+        <div class="video-minute-list-container" id="video-minute-list-container">
+          <div class="video-minute-list-header">视频分段</div>
+          <div class="video-minute-list" id="video-minute-list">
+            <!-- 分钟列表将动态生成 -->
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Screenshot Browser Modal -->
+  <div class="screenshot-browser-modal" id="screenshot-browser-modal" onclick="if(event.target.id==='screenshot-browser-modal') closeScreenshotBrowser();">
+    <div class="screenshot-browser-content">
+      <div class="modal-header">
+        <div id="screenshot-browser-title">截图浏览</div>
+        <div class="modal-actions">
+          <button class="ghost" onclick="closeScreenshotBrowser()">关闭</button>
+        </div>
+      </div>
+      <div class="screenshot-browser-body">
+        <div class="screenshot-display-container">
+          <div class="screenshot-nav-left" onclick="navigateScreenshot(-1)" title="上一分钟">
+            <span style="font-size: 32px; color: rgba(255,255,255,0.7);">‹</span>
+          </div>
+          <div class="screenshot-display-area" onclick="playCurrentMinuteVideo(event)">
+            <div class="screenshot-loading" id="screenshot-loading">加载中...</div>
+            <img id="screenshot-display-img" src="" alt="截图" style="display:none; max-width:100%; max-height:100%; object-fit:contain; cursor:pointer;" />
+            <div class="screenshot-info" id="screenshot-info"></div>
+          </div>
+          <div class="screenshot-nav-right" onclick="navigateScreenshot(1)" title="下一分钟">
+            <span style="font-size: 32px; color: rgba(255,255,255,0.7);">›</span>
+          </div>
+        </div>
+        <div class="screenshot-minute-list-container">
+          <div class="screenshot-minute-list-header">视频分段</div>
+          <div class="screenshot-minute-list" id="screenshot-minute-list">
+            <!-- 分钟列表将动态生成 -->
+          </div>
+        </div>
+      </div>
+      <div class="screenshot-browser-footer">
+        <div id="screenshot-counter">0 / 0</div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
+
+

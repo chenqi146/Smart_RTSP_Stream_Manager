@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>智能停车监控 - 高新停车场 A区</title>
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            'status-green': '#10B981',
+            'status-red': '#EF4444',
+            'status-yellow': '#F59E0B'
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    .modal-overlay {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background: rgba(0,0,0,0.5);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 1000;
+    }
+    .modal-content {
+      background: white;
+      border-radius: 0.5rem;
+      max-width: 800px;
+      width: 90%;
+      max-height: 90vh;
+      overflow-y: auto;
+    }
+    .spot-card:hover {
+      box-shadow: 0 10px 15px -3px rgba(0,0,0,0.1);
+    }
+  </style>
+</head>
+<body class="bg-gray-50 p-4 md:p-6">
+
+<!-- 顶部信息栏 -->
+<div class="bg-white rounded-lg shadow p-4 mb-6">
+  <div class="flex flex-col md:flex-row justify-between items-start md:items-center gap-2">
+    <div>
+      <h1 class="text-xl font-bold text-gray-800">高新停车场 · A区（通道 c1）</h1>
+      <p class="text-sm text-gray-500">最后更新：<span id="last-update-time">18:39:05</span>（<span id="time-ago">1秒前</span>）</p>
+    </div>
+    <div class="flex items-center gap-3">
+      <span id="system-status" class="px-2 py-1 rounded-full text-xs font-medium bg-green-100 text-green-800">
+        系统正常
+      </span>
+      <button id="toggle-debug" class="text-xs text-blue-600 hover:underline">开启调试</button>
+      <button id="toggle-filter" class="px-3 py-1 bg-blue-50 text-blue-700 rounded text-xs">仅看异常</button>
+    </div>
+  </div>
+</div>
+
+<!-- 车位网格容器 -->
+<div id="spots-grid" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-4"></div>
+
+<!-- 最近事件（可选） -->
+<div id="events-section" class="mt-8 bg-white rounded-lg shadow p-4 hidden">
+  <h2 class="text-lg font-semibold mb-3">最近状态变化</h2>
+  <ul id="events-list" class="space-y-2 text-sm"></ul>
+</div>
+
+<!-- 模态框占位（初始隐藏） -->
+<div id="modal-container"></div>
+
+<script>
+// ===== 模拟数据（实际应从 WebSocket 或 API 获取）=====
+const spotsData = [
+  { id: 'GXSL001', name: '01', status: 'occupied', confidence: 0.77, similarity: 84.3, uncertain: true, interference: ['暗光', '遮挡'] },
+  { id: 'GXSL002', name: '02', status: 'occupied', confidence: 0.92, similarity: 91.2, uncertain: false, interference: [] },
+  { id: 'GXSL003', name: '03', status: 'empty', confidence: null, similarity: null, uncertain: false, interference: [] },
+  { id: 'GXSL004', name: '04', status: 'occupied', confidence: 0.88, similarity: 89.1, uncertain: false, interference: [] },
+  { id: 'GXSL005', name: '05', status: 'occupied', confidence: 0.85, similarity: 87.5, uncertain: false, interference: [] },
+  { id: 'GXSL006', name: '06', status: 'occupied', confidence: 0.63, similarity: 83.7, uncertain: true, interference: ['暗光'] }
+];
+
+const recentEvents = [
+  { time: '18:39:02', spot: 'GXSL006', type: 'arrive', similarity: 83.7 },
+  { time: '18:38:30', spot: 'GXSL003', type: 'leave' }
+];
+
+// ===== 状态管理 =====
+let debugMode = false;
+let filterUncertain = true; // 默认只看异常
+let selectedSpot = null;
+
+// ===== 工具函数 =====
+function getDisplayStatus(spot) {
+  if (spot.uncertain) return '有车?';
+  return spot.status === 'occupied' ? '有车' : '空';
+}
+
+function getStatusColor(spot) {
+  if (spot.uncertain) return 'border-yellow-400 ring-yellow-400';
+  if (spot.status === 'occupied') return 'border-green-500 ring-green-500';
+  return 'border-red-500 ring-red-500';
+}
+
+function getTextClass(spot) {
+  if (spot.uncertain) return 'text-yellow-600 font-medium';
+  if (spot.status === 'occupied') return 'text-green-600 font-medium';
+  return 'text-red-600 font-medium';
+}
+
+function renderSpots() {
+  const grid = document.getElementById('spots-grid');
+  let filtered = filterUncertain ? spotsData.filter(s => s.uncertain) : spotsData;
+
+  grid.innerHTML = filtered.map(spot => `
+    <div class="bg-white rounded-lg shadow cursor-pointer spot-card ${getStatusColor(spot)}"
+         data-id="${spot.id}">
+      <div class="p-3 text-center">
+        <div class="font-semibold text-gray-800">${spot.name}</div>
+        <div class="mt-1 text-sm ${getTextClass(spot)}">${getDisplayStatus(spot)}</div>
+        ${spot.confidence !== null ? `<div class="mt-1 text-xs text-gray-500">${Math.round(spot.confidence * 100)}%</div>` : ''}
+        ${debugMode && spot.interference.length > 0 ? `
+          <div class="mt-1 flex justify-center text-xs">
+            ${spot.interference.includes('暗光') ? '<span class="text-blue-500">🌙</span>' : ''}
+            ${spot.interference.includes('遮挡') ? '<span class="text-purple-500">🌳</span>' : ''}
+            ${spot.confidence < 0.7 ? '<span class="text-yellow-500">⚠️</span>' : ''}
+          </div>
+        ` : ''}
+      </div>
+    </div>
+  `).join('');
+
+  // 绑定点击事件
+  document.querySelectorAll('.spot-card').forEach(card => {
+    card.addEventListener('click', () => {
+      const id = card.dataset.id;
+      selectedSpot = spotsData.find(s => s.id === id);
+      openModal();
+    });
+  });
+
+  // 更新系统状态
+  const uncertainCount = spotsData.filter(s => s.uncertain).length;
+  const statusEl = document.getElementById('system-status');
+  if (uncertainCount === 0) {
+    statusEl.className = 'px-2 py-1 rounded-full text-xs font-medium bg-green-100 text-green-800';
+    statusEl.textContent = '系统正常';
+  } else {
+    statusEl.className = 'px-2 py-1 rounded-full text-xs font-medium bg-yellow-100 text-yellow-800';
+    statusEl.textContent = `注意：${uncertainCount}个车位识别不稳定`;
+  }
+
+  // 显示/隐藏事件区
+  const eventsSection = document.getElementById('events-section');
+  if (recentEvents.length > 0) {
+    eventsSection.classList.remove('hidden');
+    const list = document.getElementById('events-list');
+    list.innerHTML = recentEvents.map(e => `
+      <li>
+        <span class="font-mono text-gray-500">${e.time}</span>
+        → <span class="font-medium">${e.spot}</span>:
+        <span class="${e.type === 'arrive' ? 'text-green-600' : 'text-red-600'}">
+          ${e.type === 'arrive' ? '车辆进入' : '车辆离开'}
+        </span>
+        ${e.similarity ? `<span class="text-gray-500 ml-2">(相似度: ${e.similarity}%)</span>` : ''}
+      </li>
+    `).join('');
+  }
+}
+
+function openModal() {
+  if (!selectedSpot) return;
+
+  const modalHTML = `
+    <div class="modal-overlay">
+      <div class="modal-content">
+        <div class="p-4 border-b flex justify-between items-center">
+          <h3 class="font-bold">${selectedSpot.name} 详情</h3>
+          <button id="close-modal" class="text-gray-500 hover:text-gray-700 text-2xl">&times;</button>
+        </div>
+        <div class="p-4 space-y-4">
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <p class="text-sm text-gray-500">当前截图</p>
+              <div class="w-full border rounded mt-1 bg-gray-100 h-32 flex items-center justify-center text-gray-400">
+                图像占位（实际路径：..._c1.jpg）
+              </div>
+            </div>
+            <div>
+              <p class="text-sm text-gray-500">上一帧（18:38:55）</p>
+              <div class="w-full border rounded mt-1 bg-gray-100 h-32 flex items-center justify-center text-gray-400">
+                图像占位
+              </div>
+            </div>
+          </div>
+
+          <div class="text-sm space-y-1">
+            <p><span class="font-medium">当前状态：</span>${getDisplayStatus(selectedSpot)}</p>
+            <p><span class="font-medium">YOLO 置信度：</span>${Math.round(selectedSpot.confidence * 100)}%</p>
+            <p><span class="font-medium">特征相似度：</span>${selectedSpot.similarity}%</p>
+            <p><span class="font-medium">干扰因素：</span>${selectedSpot.interference.length ? selectedSpot.interference.join(', ') : '无'}</p>
+          </div>
+
+          <div class="flex gap-2 pt-2">
+            <button id="confirm-occupied" class="px-3 py-1 bg-green-100 text-green-700 rounded text-sm">✓ 确认有车</button>
+            <button id="confirm-empty" class="px-3 py-1 bg-red-100 text-red-700 rounded text-sm">✗ 确认为空</button>
+            <button id="modal-close-btn" class="px-3 py-1 bg-gray-100 text-gray-700 rounded text-sm">关闭</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+
+  document.getElementById('modal-container').innerHTML = modalHTML;
+
+  // 绑定按钮事件
+  document.getElementById('close-modal').onclick = closeModal;
+  document.getElementById('modal-close-btn').onclick = closeModal;
+  document.getElementById('confirm-occupied').onclick = () => confirmStatus('occupied');
+  document.getElementById('confirm-empty').onclick = () => confirmStatus('empty');
+}
+
+function closeModal() {
+  document.getElementById('modal-container').innerHTML = '';
+  selectedSpot = null;
+}
+
+function confirmStatus(status) {
+  alert(`✅ 已人工确认 ${selectedSpot.name} 为 ${status === 'occupied' ? '有车' : '空'}`);
+  // 这里可调用 fetch() 提交到后端
+  closeModal();
+}
+
+// ===== 初始化事件绑定 =====
+document.getElementById('toggle-debug').addEventListener('click', () => {
+  debugMode = !debugMode;
+  document.getElementById('toggle-debug').textContent = debugMode ? '关闭调试' : '开启调试';
+  renderSpots();
+});
+
+document.getElementById('toggle-filter').addEventListener('click', () => {
+  filterUncertain = !filterUncertain;
+  document.getElementById('toggle-filter').textContent = filterUncertain ? '显示全部' : '仅看异常';
+  renderSpots();
+});
+
+// ===== 启动 =====
+renderSpots();
+
+// 模拟时间更新
+setInterval(() => {
+  document.getElementById('time-ago').textContent = '刚刚';
+}, 1000);
+</script>
+
+</body>
+</html>

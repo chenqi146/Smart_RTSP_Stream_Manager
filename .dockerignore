@@ -1,0 +1,48 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv
+venv
+env
+ENV
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# 本地数据与日志（不打包进镜像，用 volume 挂载）
+logs/
+screenshots/
+hls/
+*.log
+*.log.*
+
+# 测试与开发
+tests/
+testopvc/
+*.md
+!README*.md
+
+# 部署脚本（保留 deploy_docker 相关）
+deploy_putty.ps1
+deploy_auto.ps1
+deploy_scp.ps1
+deploy_with_password.ps1
+accept_host_key*.ps1
+install_password_tools.ps1
+setup_ssh_key.ps1
+check_tools.ps1
+*.bat
+
+# 大文件可选：若镜像需包含 yolov8n 则不要忽略
+# app/yolov8n.pt
+# models/yolov8n.pt
